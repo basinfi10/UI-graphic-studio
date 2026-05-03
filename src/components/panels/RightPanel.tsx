@@ -185,6 +185,11 @@ function IconStudioPanel({ state, dispatch }: { state: EditorState; dispatch: Re
   const [withBg, setWithBg] = useState(true);
   const [imageSrc, setImageSrc] = useState('');
   const [imageScale, setImageScale] = useState(86);
+  const [extractEnabled, setExtractEnabled] = useState(false);
+  const [extractMode, setExtractMode] = useState<'corner' | 'white' | 'black'>('corner');
+  const [extractTolerance, setExtractTolerance] = useState(42);
+  const [extractFeather, setExtractFeather] = useState(2);
+  const [autoFitSubject, setAutoFitSubject] = useState(true);
   const [volume, setVolume] = useState(true);
   const [emboss, setEmboss] = useState(true);
   const [shadow, setShadow] = useState(true);
@@ -211,6 +216,156 @@ function IconStudioPanel({ state, dispatch }: { state: EditorState; dispatch: Re
   const dataUrlToBlob = async (dataUrl: string) => {
     const res = await fetch(dataUrl);
     return await res.blob();
+  };
+
+  const distance = (r1: number, g1: number, b1: number, r2: number, g2: number, b2: number) => {
+    const dr = r1 - r2;
+    const dg = g1 - g2;
+    const db = b1 - b2;
+    return Math.sqrt(dr * dr + dg * dg + db * db);
+  };
+
+  const sampleCornerColor = (data: Uint8ClampedArray, w: number, h: number) => {
+    if (extractMode === 'white') return { r: 255, g: 255, b: 255 };
+    if (extractMode === 'black') return { r: 0, g: 0, b: 0 };
+    const sample = Math.max(2, Math.min(10, Math.floor(Math.min(w, h) * 0.035)));
+    let r = 0, g = 0, b = 0, count = 0;
+    const zones = [
+      [0, 0],
+      [Math.max(0, w - sample), 0],
+      [0, Math.max(0, h - sample)],
+      [Math.max(0, w - sample), Math.max(0, h - sample)],
+    ];
+    for (const [sx, sy] of zones) {
+      for (let yy = 0; yy < sample; yy++) {
+        for (let xx = 0; xx < sample; xx++) {
+          const x = Math.min(w - 1, sx + xx);
+          const y = Math.min(h - 1, sy + yy);
+          const i = (y * w + x) * 4;
+          if (data[i + 3] < 10) continue;
+          r += data[i]; g += data[i + 1]; b += data[i + 2]; count++;
+        }
+      }
+    }
+    return count ? { r: r / count, g: g / count, b: b / count } : { r: 255, g: 255, b: 255 };
+  };
+
+  const applyEdgeBackgroundExtraction = (canvas: HTMLCanvasElement) => {
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return canvas;
+    const w = canvas.width;
+    const h = canvas.height;
+    if (w < 2 || h < 2) return canvas;
+    const imageData = ctx.getImageData(0, 0, w, h);
+    const data = imageData.data;
+    const bg = sampleCornerColor(data, w, h);
+    const threshold = Math.max(2, extractTolerance);
+    const mask = new Uint8Array(w * h);
+    const queue = new Int32Array(w * h);
+    let head = 0, tail = 0;
+
+    const isBg = (p: number) => {
+      const i = p * 4;
+      if (data[i + 3] <= 8) return true;
+      return distance(data[i], data[i + 1], data[i + 2], bg.r, bg.g, bg.b) <= threshold;
+    };
+    const add = (p: number) => {
+      if (p < 0 || p >= mask.length || mask[p]) return;
+      if (!isBg(p)) return;
+      mask[p] = 1;
+      queue[tail++] = p;
+    };
+
+    for (let x = 0; x < w; x++) { add(x); add((h - 1) * w + x); }
+    for (let y = 0; y < h; y++) { add(y * w); add(y * w + w - 1); }
+
+    while (head < tail) {
+      const p = queue[head++];
+      const x = p % w;
+      const y = Math.floor(p / w);
+      if (x > 0) add(p - 1);
+      if (x < w - 1) add(p + 1);
+      if (y > 0) add(p - w);
+      if (y < h - 1) add(p + w);
+    }
+
+    const feather = Math.max(0, Math.min(8, extractFeather));
+    if (feather > 0) {
+      const alpha = new Float32Array(w * h);
+      alpha.fill(1);
+      for (let p = 0; p < mask.length; p++) if (mask[p]) alpha[p] = 0;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const p = y * w + x;
+          if (mask[p]) continue;
+          let minD = Infinity;
+          for (let dy = -feather; dy <= feather; dy++) {
+            const yy = y + dy;
+            if (yy < 0 || yy >= h) continue;
+            for (let dx = -feather; dx <= feather; dx++) {
+              const xx = x + dx;
+              if (xx < 0 || xx >= w) continue;
+              const q = yy * w + xx;
+              if (!mask[q]) continue;
+              const d = Math.sqrt(dx * dx + dy * dy);
+              if (d < minD) minD = d;
+            }
+          }
+          if (minD <= feather) alpha[p] = Math.max(0.18, Math.min(1, minD / (feather + 0.001)));
+        }
+      }
+      for (let p = 0; p < mask.length; p++) {
+        const i = p * 4;
+        data[i + 3] = Math.round(data[i + 3] * alpha[p]);
+      }
+    } else {
+      for (let p = 0; p < mask.length; p++) if (mask[p]) data[p * 4 + 3] = 0;
+    }
+    ctx.putImageData(imageData, 0, 0);
+    return canvas;
+  };
+
+  const trimTransparentCanvas = (source: HTMLCanvasElement, padding = 8) => {
+    const ctx = source.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return source;
+    const w = source.width, h = source.height;
+    const data = ctx.getImageData(0, 0, w, h).data;
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (data[(y * w + x) * 4 + 3] <= 12) continue;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (maxX < minX || maxY < minY) return source;
+    minX = Math.max(0, minX - padding); minY = Math.max(0, minY - padding);
+    maxX = Math.min(w - 1, maxX + padding); maxY = Math.min(h - 1, maxY + padding);
+    const out = document.createElement('canvas');
+    out.width = Math.max(1, maxX - minX + 1);
+    out.height = Math.max(1, maxY - minY + 1);
+    out.getContext('2d')?.drawImage(source, minX, minY, out.width, out.height, 0, 0, out.width, out.height);
+    return out;
+  };
+
+  const prepareSourceImage = async (src: string) => {
+    const img = await readImage(src);
+    const maxSide = 1100;
+    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(img.width * scale));
+    canvas.height = Math.max(1, Math.round(img.height * scale));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return canvas;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    if (extractEnabled) {
+      applyEdgeBackgroundExtraction(canvas);
+      if (autoFitSubject) return trimTransparentCanvas(canvas, Math.max(6, Math.round(Math.min(canvas.width, canvas.height) * 0.025)));
+    }
+    return canvas;
   };
 
   const buildPng = async () => {
@@ -253,14 +408,15 @@ function IconStudioPanel({ state, dispatch }: { state: EditorState; dispatch: Re
     }
 
     if (imageSrc) {
-      const img = await readImage(imageSrc);
+      const prepared = await prepareSourceImage(imageSrc);
       const scale = imageScale / 100;
-      const iw = box.w * scale;
-      const ih = box.h * scale;
-      const aspect = img.width / img.height;
-      let dw = iw, dh = ih;
-      if (aspect >= 1) dh = dw / aspect; else dw = dh * aspect;
-      ctx.drawImage(img, box.x + (box.w - dw) / 2, box.y + (box.h - dh) / 2, dw, dh);
+      const maxW = box.w * scale;
+      const maxH = box.h * scale;
+      const aspect = prepared.width / Math.max(1, prepared.height);
+      let dw = maxW;
+      let dh = dw / aspect;
+      if (dh > maxH) { dh = maxH; dw = dh * aspect; }
+      ctx.drawImage(prepared, box.x + (box.w - dw) / 2, box.y + (box.h - dh) / 2, dw, dh);
     } else {
       ctx.font = `700 ${Math.round(size * 0.42)}px "Segoe UI Emoji", "Segoe UI Symbol", system-ui, sans-serif`;
       ctx.textAlign = 'center';
@@ -341,6 +497,9 @@ function IconStudioPanel({ state, dispatch }: { state: EditorState; dispatch: Re
     if (!file) return;
     const src = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsDataURL(file); });
     setImageSrc(src);
+    setExtractEnabled(true);
+    setExtractMode('corner');
+    setLastPng('');
     setLabel(file.name.replace(/\.[^.]+$/, '') || 'Image Icon');
     event.target.value = '';
   };
@@ -357,12 +516,19 @@ function IconStudioPanel({ state, dispatch }: { state: EditorState; dispatch: Re
 
   return <div className="panel-stack icon-studio-panel">
     <h3>아이콘 제작</h3>
-    <p className="panel-help">이미지 또는 심볼을 불러와 투명 모서리의 앱 아이콘으로 제작합니다. 둥글기, 볼륨감, 엠보싱, 그림자를 적용하고 PNG/SVG로 저장하거나 보관함에 저장해 재사용할 수 있습니다.</p>
+    <p className="panel-help">이미지 또는 심볼을 불러와 앱 아이콘으로 제작합니다. 이미지의 외곽 배경을 자동 투명 처리해 주요 개체를 따낼 수 있고, 둥글기·볼륨감·엠보싱·그림자를 적용해 PNG/SVG로 저장하거나 보관함에 저장할 수 있습니다.</p>
     <div className="icon-studio-preview image-icon-preview" style={{ width: 156, height: 156, borderRadius: Math.min(34, radius / Math.max(1, size) * 156), color, background: withBg ? background : 'transparent' }}>
       {lastPng ? <img src={lastPng} alt="icon preview"/> : imageSrc ? <img src={imageSrc} alt="icon source"/> : <span>{symbol || '✦'}</span>}
     </div>
-    <div className="button-grid"><button onClick={() => fileRef.current?.click()}>이미지 불러오기</button><button onClick={() => { setImageSrc(''); setLastPng(''); }}>이미지 제거</button></div>
+    <div className="button-grid"><button onClick={() => fileRef.current?.click()}>이미지 불러오기</button><button onClick={() => { setImageSrc(''); setLastPng(''); }}>이미지 제거</button><button onClick={ensurePng}>추출 미리보기</button><button onClick={() => { setExtractEnabled(true); setExtractMode('corner'); setLastPng(''); }}>외곽 투명 자동</button></div>
     <input ref={fileRef} className="hidden-input" type="file" accept="image/*" onChange={openImage}/>
+    {imageSrc && <div className="extract-panel">
+      <h4>주요 개체 추출</h4>
+      <p className="panel-help">모서리에서 연결된 배경만 제거합니다. 내부 흰색 글자나 밝은 영역은 최대한 보존합니다.</p>
+      <div className="two"><Field label="외곽 배경 투명"><input type="checkbox" checked={extractEnabled} onChange={e=>{setExtractEnabled(e.target.checked); setLastPng('');}} /></Field><Field label="자동 여백 맞춤"><input type="checkbox" checked={autoFitSubject} onChange={e=>{setAutoFitSubject(e.target.checked); setLastPng('');}} /></Field></div>
+      <Field label="배경 기준"><select value={extractMode} onChange={e=>{setExtractMode(e.target.value as 'corner' | 'white' | 'black'); setLastPng('');}}><option value="corner">모서리 자동</option><option value="white">흰 배경</option><option value="black">검은 배경</option></select></Field>
+      <div className="two"><Field label={`허용 범위 ${extractTolerance}`}><input type="range" min="8" max="150" value={extractTolerance} onChange={e=>{setExtractTolerance(Number(e.target.value)); setLastPng('');}} /></Field><Field label={`가장자리 부드럽게 ${extractFeather}px`}><input type="range" min="0" max="8" value={extractFeather} onChange={e=>{setExtractFeather(Number(e.target.value)); setLastPng('');}} /></Field></div>
+    </div>}
     <Field label="아이콘 심볼"><input value={symbol} onChange={e=>{setSymbol(e.target.value.slice(0, 8)); setLastPng('');}} placeholder="예: ✦, 🔍, ⚙" /></Field>
     <Field label="이름"><input value={label} onChange={e=>setLabel(e.target.value)} /></Field>
     <div className="two"><Field label="아이콘 색"><input type="color" value={color} onChange={e=>{setColor(e.target.value); setLastPng('');}} /></Field><Field label="배경색"><input type="color" value={background} onChange={e=>{setBackground(e.target.value); setLastPng('');}} /></Field></div>
